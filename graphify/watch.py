@@ -627,6 +627,7 @@ class _StoredSourcePaths:
         self._normalize_source = normalize_source
         self.existing_source_root = project_root
         self._identity_cache: dict[str, str | None] = {}
+        self._rebase_cache: dict[str, str | None] = {}
         self._in_watch_root_cache: dict[str, bool] = {}
         relative_marker_prefix: str | None = None
 
@@ -759,19 +760,30 @@ class _StoredSourcePaths:
         return self.identity(item.get("source_file")) in identities
 
     def rebase_preserved(self, item: dict) -> None:
-        identity = self.identity(item.get("source_file"))
+        source_file = item.get("source_file")
+        if isinstance(source_file, str):
+            if source_file not in self._rebase_cache:
+                self._rebase_cache[source_file] = self._rebased_source(source_file)
+            rebased = self._rebase_cache[source_file]
+        else:
+            rebased = self._rebased_source(source_file)
+        if rebased:
+            item["source_file"] = rebased
+
+    def _rebased_source(self, source_file: str | None) -> str | None:
+        # Roots and lexical source identities are fixed for this reconciliation.
+        # Thousands of nodes/edges share a file; do its Path operations once.
+        # Instance lifetime prevents cache leakage across roots or updates.
+        identity = self.identity(source_file)
         if not identity:
-            return
+            return None
         identity_path = Path(identity)
         if not _is_relative_to(identity_path, self.watch_root):
-            normalized = self.normalize(item.get("source_file"))
-            if normalized:
-                item["source_file"] = normalized
-            return
+            return self.normalize(source_file)
         try:
-            item["source_file"] = identity_path.relative_to(self.project_root).as_posix()
+            return identity_path.relative_to(self.project_root).as_posix()
         except ValueError:
-            item["source_file"] = identity
+            return identity
 
 
 # A source_file that is a URL/virtual scheme (gdoc://, s3://, http://, ...) rather
@@ -1584,6 +1596,77 @@ def _reconcile_existing_graph(
             file=sys.stderr,
         )
         return result, existing_graph_data
+
+
+def _js_reconciliation_paths(targets: list[Path], graph: dict, available: list[Path],
+                             changed: list[Path], root: Path) -> list[Path]:
+    """Refresh affected JS consumers and unchanged re-export resolution context.
+
+    Existing resolved edges supply both upstream consumers and downstream
+    resolution context. Fresh facts from changed files add newly-imported
+    modules. This uses the native resolver, never a second import parser.
+    Additions/deletions can bind previously unresolved imports, so they require
+    a conservative JS-corpus pass until unresolved bindings are persisted.
+    """
+    from collections import defaultdict, deque
+    from graphify.extractors import resolution as resolver
+    from graphify.extractors.models import _JS_CACHE_BYPASS_SUFFIXES
+    from graphify.rcfile import effective_suffix
+
+    def identity(value):
+        path = Path(value)
+        return Path(os.path.abspath(path if path.is_absolute() else root / path))
+
+    js_files = {identity(path): path for path in available
+                if effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES}
+    changed_js = {identity(path) for path in changed
+                  if effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES}
+    if not changed_js:
+        return targets
+    node_files = {node.get("id"): identity(node["source_file"])
+                  for node in graph.get("nodes", []) if node.get("source_file")}
+    known = set(node_files.values())
+    if any(path not in js_files or path not in known for path in changed_js):
+        print("[graphify watch] JS file set changed; refreshing JS resolution corpus.")
+        wanted = set(js_files)
+    else:
+        importers = defaultdict(set)
+        barrels = set()
+        for edge in graph.get("links", graph.get("edges", [])):
+            left, right = node_files.get(edge.get("source")), node_files.get(edge.get("target"))
+            if left in js_files and right in js_files and left != right:
+                # Include inferred relationships conservatively, without
+                # promoting their provenance during normal extraction.
+                importers[right].add(left)
+                if edge.get("relation") == "re_exports":
+                    barrels.add(left)
+        # Native resolution caches are per build, including long-lived watch.
+        for cache in (resolver._WORKSPACE_PACKAGE_CACHE, resolver._TSCONFIG_ALIAS_CACHE,
+                      resolver._TSCONFIG_BASEURL_CACHE, resolver._PACKAGE_IMPORTS_CACHE):
+            cache.clear()
+        resolver._cached_realpath.cache_clear()
+        wanted = set(changed_js)
+        pending = deque(sorted(wanted))
+        while pending:
+            current = pending.popleft()
+            # Unchanged terminal declarations already live in read-only resolver
+            # context. Only barrels need their authored export facts reparsed.
+            facts = resolver._SymbolResolutionFacts()
+            resolver._collect_js_symbol_resolution_facts([current], facts)
+            dependencies = set(importers[current])
+            for fact in [*facts.imports, *facts.exports, *facts.star_exports, *facts.namespace_exports]:
+                if fact.target_path is not None:
+                    target = identity(fact.target_path)
+                    if target in js_files and (target in barrels or current in barrels):
+                        dependencies.add(target)
+            for dependency in sorted(dependencies):
+                if dependency not in wanted:
+                    wanted.add(dependency)
+                    pending.append(dependency)
+    result = {identity(path): path for path in targets}
+    result.update({key: js_files[key] for key in wanted if key in js_files})
+    print(f"[graphify watch] JS dependency reconciliation: {len(wanted)} of {len(js_files)} files.")
+    return [result[key] for key in sorted(result)]
 
 
 def _node_community_map(graph_data: dict) -> dict[str, int]:
@@ -2712,6 +2795,11 @@ def _rebuild_code(
                     watch_root=watch_root,
                     normalize_source=_nsf,
                 )
+                extract_targets = _js_reconciliation_paths(
+                    extract_targets, ctx_graph, code_files,
+                    [*extract_targets, *(Path(p) for p in deleted_source_identities)],
+                    project_root,
+                )
                 from graphify.extractors.resolution import _cpp_reconciliation_paths
                 extract_targets = _cpp_reconciliation_paths(
                     extract_targets, ctx_graph.get("nodes", []), project_root,
@@ -2851,11 +2939,10 @@ def _rebuild_code(
                                 lexical_scopes
                             )
                     resolution_context_edges.append(context_edge)
-            except Exception:
-                # Unreadable/oversized graph: resolve with the changed batch only
-                # (pre-#2406 behavior). Reconcile below still fails closed on it.
-                resolution_context_nodes = []
-                resolution_context_edges = []
+            except Exception as exc:
+                # An incomplete dependency scope cannot be published as current.
+                print(f"error: Cannot prepare incremental resolution context: {exc}", file=sys.stderr)
+                return False
 
         commit = _git_head(cwd=watch_root)
         result = extract(
