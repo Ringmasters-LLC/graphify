@@ -86,3 +86,12 @@ def test_cli_projection_is_explicit_and_preserves_native_graph(tmp_path):
     assert second.returncode == 0,second.stderr
     assert (output/'graph.json').read_bytes()==original
     assert view(output/'graph.json','a_a') is not None
+
+
+def test_unicode_projection_uses_reproducible_utf8_bytes(tmp_path):
+    graph=tmp_path/'graph.json'
+    graph.write_text(json.dumps({'nodes':[{'id':'日本語','label':'日本語','source_file':'日本語.ts'}],'links':[]}),encoding='utf-8')
+    build(graph)
+    assert view(graph,'日本語')['nodes'][0]['label']=='日本語'
+    for component in (tmp_path/'structural-index').glob('*.json'):
+        json.loads(component.read_bytes().decode('utf-8'))

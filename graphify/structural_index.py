@@ -35,7 +35,7 @@ def bucket(key):
 def write(path, data):
     fd, name = tempfile.mkstemp(prefix='.query-', dir=path.parent)
     try:
-        with os.fdopen(fd, 'w') as target:
+        with os.fdopen(fd, 'w', encoding='utf-8') as target:
             encoded = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
             target.write(encoded)
         os.replace(name, path)
@@ -49,7 +49,7 @@ def build(graph):
     root = graph.parent / 'structural-index'
     root.mkdir(exist_ok=True)
     try:
-        previous = json.loads((root / 'manifest.json').read_text())
+        previous = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
         expected = {f'n{index:02}.json' for index in range(BUCKETS)} | {'imports.json'}
         if previous['schema'] == SCHEMA and set(previous['files']) == expected:
             if (previous['graph'] == signature(graph)
@@ -110,7 +110,7 @@ def view(graph, symbol=None):
     graph = Path(graph)
     root = graph.parent / 'structural-index'
     try:
-        manifest = json.loads((root / 'manifest.json').read_text())
+        manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
         if manifest['schema'] != SCHEMA or manifest['graph'] != signature(graph):
             return None
         if symbol is None:
@@ -128,7 +128,7 @@ def view(graph, symbol=None):
             path = root / name
             if signature(path) != manifest['files'][name]['signature']:
                 return None
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding='utf-8'))
             if symbol is None:
                 return data if signature(path) == manifest['files'][name]['signature'] else None
             nodes.update(data['nodes'])
