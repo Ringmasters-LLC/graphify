@@ -2,7 +2,7 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
-## 0.9.106+agenthub.2 (2026-11-12)
+## 0.9.106+agenthub.3 (2026-11-12)
 
 - Retry previously unrepresented failures without building global resolver context or reconciling/serializing an unchanged graph. Failures remain unstamped and are retried, so recovery and newly installed grammars remain observable.
 - Build disposable import and incident-edge read projections for AST-only `update --no-cluster`. Preserve edge ordinals, parallel relationships, source references and provenance; validate graph/component identities and fall back to graph.json on any doubt. No daemon or database.
