@@ -2184,7 +2184,7 @@ def _write_build_state(out: Path, state: dict, *, full_clean: bool) -> None:
         pass
 
 
-def _build_state_matches(out: Path, state: dict) -> bool:
+def _build_state_matches(out: Path, state: dict, *, allow_incremental: bool = False) -> bool:
     """True when ``out`` still holds exactly what the last stamped rebuild wrote.
 
     Fails closed on anything it cannot prove: a missing or unreadable stamp, a
@@ -2202,7 +2202,7 @@ def _build_state_matches(out: Path, state: dict) -> bool:
         if prev.get(key) != value:
             return False
     # Only a full rebuild leaves a graph a full rebuild could have produced.
-    if prev.get("full_clean") is not True:
+    if not allow_incremental and prev.get("full_clean") is not True:
         return False
     try:
         st = (out / "graph.json").stat()
@@ -2784,6 +2784,7 @@ def _rebuild_code(
         # is parsed, mutated, or emitted from them (see extract()'s docstring).
         resolution_context_nodes: list[dict] = []
         resolution_context_edges: list[dict] = []
+        retry_only_empty = False
         if changed_paths is not None and existing_graph.exists():
             try:
                 check_graph_file_size_cap(existing_graph)
@@ -2800,6 +2801,16 @@ def _rebuild_code(
                     [*extract_targets, *(Path(p) for p in deleted_source_identities)],
                     project_root,
                 )
+                target_identities = {ctx_paths.absolute_identity(str(p), project_root)
+                                     for p in extract_targets}
+                # Previously unrepresented failures still retry, so installed
+                # grammars and transient recovery are observed. They need no
+                # global resolver context when graph/config/corpus are unchanged.
+                retry_only_empty = (not deleted_paths and not deleted_source_identities
+                    and _build_state_matches(out, _build_state_now, allow_incremental=True)
+                    and not any(ctx_paths.identity(item.get("source_file")) in target_identities
+                                for bucket in ("nodes", "links", "edges", "hyperedges")
+                                for item in ctx_graph.get(bucket, [])))
                 from graphify.extractors.resolution import _cpp_reconciliation_paths
                 extract_targets = _cpp_reconciliation_paths(
                     extract_targets, ctx_graph.get("nodes", []), project_root,
@@ -2814,7 +2825,7 @@ def _rebuild_code(
                 }
                 ctx_live -= deleted_source_identities
                 ctx_live.discard(None)
-                for node in ctx_graph.get("nodes", []):
+                for node in ([] if retry_only_empty else ctx_graph.get("nodes", [])):
                     if not node.get("id") or not _is_ast_tier(node):
                         continue
                     source_file = node.get("source_file")
@@ -2889,7 +2900,7 @@ def _rebuild_code(
                 # deleted/re-extracted file's edges can never resurrect. Import
                 # edges come too: a TS field inherited from an unchanged file is
                 # typed by that file's imports, as in a full build.
-                for edge in ctx_graph.get("links", ctx_graph.get("edges", [])):
+                for edge in ([] if retry_only_empty else ctx_graph.get("links", ctx_graph.get("edges", []))):
                     if edge.get("relation") not in (
                         "contains", "method", "inherits", "imports", "imports_from"
                     ):
@@ -2950,11 +2961,18 @@ def _rebuild_code(
             cache_root=watch_root,
             resolution_context_nodes=resolution_context_nodes or None,
             resolution_context_edges=resolution_context_edges or None,
+            parallel=not retry_only_empty,
         ) if extract_targets else {
             "nodes": [], "edges": [], "hyperedges": [],
             "input_tokens": 0, "output_tokens": 0,
         }
         _rebase_relative_source_files(result, watch_root, project_root)
+        if (retry_only_empty and not result.get("nodes") and not result.get("edges")
+                and not result.get("hyperedges")):
+            # No owned prior items and no fresh items: reconciliation would be
+            # identity. Keep failed sources unstamped and keep all diagnostics.
+            print("[graphify watch] Retried unrepresented sources; graph unchanged.")
+            return True
 
         # #2543: AST sources that failed this run (error result, or extractor
         # present but zero nodes) must not be stamped kind="ast" below, and any

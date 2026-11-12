@@ -2,6 +2,11 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.106+agenthub.2 (2026-11-12)
+
+- Retry previously unrepresented failures without building global resolver context or reconciling/serializing an unchanged graph. Failures remain unstamped and are retried, so recovery and newly installed grammars remain observable.
+- Build disposable import and incident-edge read projections for AST-only `update --no-cluster`. Preserve edge ordinals, parallel relationships, source references and provenance; validate graph/component identities and fall back to graph.json on any doubt. No daemon or database.
+
 ## 0.9.106+agenthub.1 (2026-11-12)
 
 - Refresh affected JavaScript/TypeScript dependency components during incremental updates, including unchanged re-export barrels and importers. New or removed JS files conservatively refresh the JS corpus because previously unresolved imports can bind differently. Fail closed if incremental resolution context cannot be prepared.

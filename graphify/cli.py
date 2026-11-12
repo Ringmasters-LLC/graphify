@@ -3459,6 +3459,12 @@ def dispatch_command(cmd: str) -> None:
             block_on_lock=True,
         )
         if ok:
+            if no_cluster and os.environ.get('GRAPHIFY_STRUCTURAL_INDEX') == '1':
+                from graphify.structural_index import build as build_structural_index
+                try:
+                    build_structural_index(watch_path / _GRAPHIFY_OUT / "graph.json")
+                except (OSError, ValueError, TypeError) as exc:
+                    print(f"warning: optional structural cache unavailable: {exc}", file=sys.stderr)
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
             if not (
                 os.environ.get("GEMINI_API_KEY")
